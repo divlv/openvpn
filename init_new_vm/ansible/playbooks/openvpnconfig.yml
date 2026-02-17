@@ -1,48 +1,205 @@
-- debug:
-      msg: "Installing AZ CLI from Microsoft repo..."
+- name: OpenVPN in Docker - setup started
+  ansible.builtin.debug:
+    msg: "Installing Docker OpenVPN server and creating client profile"
 
-- name: Install prerequisites for keyrings
-  apt:
+- name: OpenVPN defaults
+  ansible.builtin.set_fact:
+    ovpn_data_volume: "{{ ovpn_data_volume | default('ovpn-data-main') }}"
+    ovpn_container_name: "{{ ovpn_container_name | default('openvpn-server') }}"
+    ovpn_protocol: "{{ ovpn_protocol | default('udp') }}"
+    ovpn_port: "{{ ovpn_port | default('1194') }}"
+    ovpn_client_name: "{{ ovpn_client_name | default('client1') }}"
+    ovpn_network: "{{ ovpn_network | default('10.8.0.0/24') }}"
+    ovpn_server_endpoint: "{{ ovpn_server_endpoint | default(hostvars[inventory_hostname].ansible_host | default(inventory_hostname)) }}"
+    ovpn_local_artifacts_dir: "{{ playbook_dir }}/../artifacts/openvpn"
+
+- name: Preseed iptables-persistent autosave IPv4
+  ansible.builtin.debconf:
+    name: iptables-persistent
+    question: iptables-persistent/autosave_v4
+    value: "true"
+    vtype: boolean
+
+- name: Preseed iptables-persistent autosave IPv6
+  ansible.builtin.debconf:
+    name: iptables-persistent
+    question: iptables-persistent/autosave_v6
+    value: "true"
+    vtype: boolean
+
+- name: Install Docker and network prerequisites
+  ansible.builtin.apt:
     name:
       - ca-certificates
       - curl
       - gnupg
+      - docker.io
+      - iptables-persistent
     state: present
-    update_cache: yes
+    update_cache: true
+  environment:
+    DEBIAN_FRONTEND: noninteractive
 
-- name: Ensure /etc/apt/keyrings exists
-  file:
-    path: /etc/apt/keyrings
-    state: directory
-    mode: "0755"
+- name: Enable and start Docker
+  ansible.builtin.service:
+    name: docker
+    state: started
+    enabled: true
 
-- name: Add Microsoft signing key (keyring)
+- name: Enable IPv4 forwarding in sysctl.conf
+  ansible.builtin.lineinfile:
+    path: /etc/sysctl.conf
+    regexp: '^#?\s*net\.ipv4\.ip_forward='
+    line: 'net.ipv4.ip_forward=1'
+
+- name: Enable IPv4 forwarding at runtime
+  ansible.builtin.command: sysctl -w net.ipv4.ip_forward=1
+  changed_when: false
+
+- name: Detect default outbound interface
+  ansible.builtin.shell: ip route | awk '/default/ {print $5; exit}'
+  args:
+    executable: /bin/bash
+  register: default_iface
+  changed_when: false
+
+- name: Configure NAT for OpenVPN subnet
   ansible.builtin.shell: |
     set -euo pipefail
-    curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg
+    if iptables -t nat -C POSTROUTING -s "{{ ovpn_network }}" -o "{{ default_iface.stdout }}" -j MASQUERADE 2>/dev/null; then
+      echo "exists"
+    else
+      iptables -t nat -A POSTROUTING -s "{{ ovpn_network }}" -o "{{ default_iface.stdout }}" -j MASQUERADE
+      echo "added"
+    fi
   args:
     executable: /bin/bash
-    creates: /etc/apt/keyrings/microsoft.gpg
+  register: openvpn_nat
+  changed_when: "'added' in openvpn_nat.stdout"
 
-- name: Add Microsoft Azure CLI repo (use correct distro codename)
-  apt_repository:
-    repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ {{ ansible_distribution_release }} main"
-    state: present
-    update_cache: yes
+- name: Persist iptables rules
+  ansible.builtin.command: netfilter-persistent save
+  changed_when: false
 
-- name: Install Microsoft Azure CLI
-  apt:
-    name: azure-cli
-    state: present
-    update_cache: yes
+- name: Pull OpenVPN Docker image
+  ansible.builtin.command: docker pull kylemanna/openvpn
+  register: docker_pull_openvpn
+  changed_when: "'Downloaded newer image' in docker_pull_openvpn.stdout or 'Status: Downloaded newer image' in docker_pull_openvpn.stdout"
 
+- name: Check OpenVPN data volume
+  ansible.builtin.command: docker volume inspect {{ ovpn_data_volume }}
+  register: ovpn_volume_check
+  failed_when: false
+  changed_when: false
 
-- name: Add -=connectedk8s=- extension
-  ansible.builtin.shell: az extension add --name connectedk8s
+- name: Create OpenVPN data volume
+  ansible.builtin.command: docker volume create --name {{ ovpn_data_volume }}
+  when: ovpn_volume_check.rc != 0
+
+- name: Check if OpenVPN server config exists
+  ansible.builtin.command: >
+    docker run --rm -v {{ ovpn_data_volume }}:/etc/openvpn
+    kylemanna/openvpn sh -c "test -f /etc/openvpn/openvpn.conf"
+  register: ovpn_conf_exists
+  failed_when: false
+  changed_when: false
+
+- name: Generate OpenVPN server config
+  ansible.builtin.command: >
+    docker run --rm -v {{ ovpn_data_volume }}:/etc/openvpn
+    kylemanna/openvpn ovpn_genconfig
+    -u {{ ovpn_protocol }}://{{ ovpn_server_endpoint }}:{{ ovpn_port }}
+    -s {{ ovpn_network }}
+  when: ovpn_conf_exists.rc != 0
+
+- name: Check if OpenVPN PKI exists
+  ansible.builtin.command: >
+    docker run --rm -v {{ ovpn_data_volume }}:/etc/openvpn
+    kylemanna/openvpn sh -c "test -f /etc/openvpn/pki/ca.crt"
+  register: ovpn_pki_exists
+  failed_when: false
+  changed_when: false
+
+- name: Initialize OpenVPN PKI (non-interactive)
+  ansible.builtin.command: >
+    docker run --rm -e EASYRSA_BATCH=1 -v {{ ovpn_data_volume }}:/etc/openvpn
+    kylemanna/openvpn ovpn_initpki nopass
+  when: ovpn_pki_exists.rc != 0
+
+- name: Ensure OpenVPN container is running
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if docker ps --filter "name=^/{{ ovpn_container_name }}$" --filter "status=running" -q | grep -q .; then
+      echo "running"
+    elif docker ps -a --filter "name=^/{{ ovpn_container_name }}$" -q | grep -q .; then
+      docker start "{{ ovpn_container_name }}" >/dev/null
+      echo "started"
+    else
+      docker run -d \
+        --name "{{ ovpn_container_name }}" \
+        --cap-add=NET_ADMIN \
+        --restart unless-stopped \
+        -p {{ ovpn_port }}:{{ ovpn_port }}/{{ ovpn_protocol }} \
+        -v {{ ovpn_data_volume }}:/etc/openvpn \
+        kylemanna/openvpn >/dev/null
+      echo "created"
+    fi
   args:
     executable: /bin/bash
+  register: ovpn_container_state
+  changed_when: "'started' in ovpn_container_state.stdout or 'created' in ovpn_container_state.stdout"
 
-- name: Add -=k8s-extension=- extension
-  ansible.builtin.shell: az extension add --name k8s-extension
+- name: Check if client certificate exists
+  ansible.builtin.command: >
+    docker run --rm -v {{ ovpn_data_volume }}:/etc/openvpn
+    kylemanna/openvpn sh -c "test -f /etc/openvpn/pki/issued/{{ ovpn_client_name }}.crt"
+  register: ovpn_client_cert_exists
+  failed_when: false
+  changed_when: false
+
+- name: Generate client certificate
+  ansible.builtin.command: >
+    docker run --rm -e EASYRSA_BATCH=1 -v {{ ovpn_data_volume }}:/etc/openvpn
+    kylemanna/openvpn easyrsa build-client-full {{ ovpn_client_name }} nopass
+  when: ovpn_client_cert_exists.rc != 0
+
+- name: Build/update client OVPN profile on server
+  ansible.builtin.shell: |
+    set -euo pipefail
+    TMP_FILE="/tmp/{{ ovpn_client_name }}.ovpn.new"
+    TARGET_FILE="/root/{{ ovpn_client_name }}.ovpn"
+    docker run --rm -v {{ ovpn_data_volume }}:/etc/openvpn kylemanna/openvpn ovpn_getclient {{ ovpn_client_name }} > "${TMP_FILE}"
+    if [ -f "${TARGET_FILE}" ] && cmp -s "${TMP_FILE}" "${TARGET_FILE}"; then
+      rm -f "${TMP_FILE}"
+      echo "unchanged"
+    else
+      mv "${TMP_FILE}" "${TARGET_FILE}"
+      chmod 0600 "${TARGET_FILE}"
+      echo "updated"
+    fi
   args:
     executable: /bin/bash
+  register: ovpn_profile_state
+  changed_when: "'updated' in ovpn_profile_state.stdout"
+
+- name: Ensure local OpenVPN artifacts directory exists
+  ansible.builtin.file:
+    path: "{{ ovpn_local_artifacts_dir }}"
+    state: directory
+    mode: "0755"
+  delegate_to: localhost
+  become: false
+
+- name: Download client profile to controller
+  ansible.builtin.fetch:
+    src: "/root/{{ ovpn_client_name }}.ovpn"
+    dest: "{{ ovpn_local_artifacts_dir }}/{{ ovpn_client_name }}.ovpn"
+    flat: true
+
+- name: OpenVPN setup summary
+  ansible.builtin.debug:
+    msg:
+      - "OpenVPN container: {{ ovpn_container_name }}"
+      - "Server profile on host: /root/{{ ovpn_client_name }}.ovpn"
+      - "Downloaded profile on controller: {{ ovpn_local_artifacts_dir }}/{{ ovpn_client_name }}.ovpn"
+      - "VPN endpoint: {{ ovpn_protocol }}://{{ ovpn_server_endpoint }}:{{ ovpn_port }}"
