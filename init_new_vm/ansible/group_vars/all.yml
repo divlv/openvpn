@@ -1,7 +1,7 @@
 # GitHub
 repo_version: "main"
-repo_local_path: "/tmp/arck3s"
-repo_https_url: "https://github.com/divlv/arck3s.git"
+repo_local_path: "/tmp/openvpn"
+repo_https_url: "https://github.com/divlv/openvpn.git"
 # Copy and start
 # file_map:
 #   - src: "init.sh"
